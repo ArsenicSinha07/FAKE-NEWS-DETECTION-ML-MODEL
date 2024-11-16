@@ -1,0 +1,162 @@
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+import os
+import cv2
+import re
+import string
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix, ConfusionMatrixDisplay
+from tensorflow.keras.applications import VGG16
+from tensorflow.keras.layers import Dense, Flatten
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+
+# --- TEXT-BASED FAKE NEWS DETECTION MODEL ---
+# Load datasets
+df_fake = pd.read_csv('Fake.csv')
+df_true = pd.read_csv('True.csv')
+
+# Assign class labels
+df_fake["class"] = 0
+df_true["class"] = 1
+
+# Combine datasets
+df_text = pd.concat([df_fake, df_true], axis=0)
+df_text = df_text.sample(frac=1).reset_index(drop=True)  # Shuffle the dataset
+
+# Drop unnecessary columns
+df_text = df_text.drop(["title", "subject", "date"], axis=1)
+
+# Text preprocessing function
+def wordopt(text):
+    text = text.lower()
+    text = re.sub(r'\[.*?\]', '', text)
+    text = re.sub(r'\\W', ' ', text)
+    text = re.sub(r'https?://\S+|www\.\S+', '', text)
+    text = re.sub(r'<.*?>+', '', text)
+    text = re.sub(r'[%s]' % re.escape(string.punctuation), '', text)
+    text = re.sub(r'\n', '', text)
+    text = re.sub(r'\w*\d\w*', '', text)
+    return text
+
+df_text["text"] = df_text["text"].apply(wordopt)
+
+# Split into features and labels
+x_text = df_text["text"]
+y_text = df_text["class"]
+
+# Split into training and test sets
+x_train_text, x_test_text, y_train_text, y_test_text = train_test_split(x_text, y_text, test_size=0.25, random_state=42)
+
+# Vectorize text data
+vectorizer = TfidfVectorizer()
+xv_train_text = vectorizer.fit_transform(x_train_text)
+xv_test_text = vectorizer.transform(x_test_text)
+
+# Initialize classifiers
+LR_text = LogisticRegression()
+RFC_text = RandomForestClassifier(random_state=0)
+MNB_text = MultinomialNB()
+
+# Create ensemble model
+ensemble_text = VotingClassifier(estimators=[
+    ('lr', LR_text), 
+    ('rf', RFC_text), 
+    ('mnb', MNB_text)
+], voting='hard')
+
+# Train ensemble model
+ensemble_text.fit(xv_train_text, y_train_text)
+
+# Evaluate text-based ensemble model
+text_accuracy = ensemble_text.score(xv_test_text, y_test_text)
+print("Text-Based Model Accuracy:", text_accuracy)
+
+# --- IMAGE-BASED FAKE NEWS DETECTION MODEL ---
+# Set paths for the dataset
+tampered_dir = "C:\\Users\\anmol\\Downloads\\CASIA2\\Tp"
+authentic_dir = "C:\\Users\\anmol\\Downloads\\CASIA2\\Au"
+image_size = (224, 224)
+
+# Function to load and preprocess images
+def load_images(directory, label):
+    images = []
+    labels = []
+    for filename in os.listdir(directory):
+        file_path = os.path.join(directory, filename)
+        img = cv2.imread(file_path)
+        if img is not None:
+            img = cv2.resize(img, image_size)
+            images.append(img)
+            labels.append(label)
+    return np.array(images), np.array(labels)
+
+# Load tampered and authentic images
+tampered_images, tampered_labels = load_images(tampered_dir, label=1)
+authentic_images, authentic_labels = load_images(authentic_dir, label=0)
+
+# Combine datasets
+X_images = np.concatenate([tampered_images, authentic_images], axis=0)
+y_images = np.concatenate([tampered_labels, authentic_labels], axis=0)
+
+# Normalize pixel values
+X_images = X_images.astype('float32') / 255.0
+
+# Split into training and testing sets
+x_train_images, x_test_images, y_train_images, y_test_images = train_test_split(X_images, y_images, test_size=0.2, random_state=42)
+
+# Load pre-trained VGG16 model
+vgg16 = VGG16(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+
+# Freeze VGG16 layers
+for layer in vgg16.layers:
+    layer.trainable = False
+
+# Add custom layers
+x = Flatten()(vgg16.output)
+x = Dense(1024, activation='relu')(x)
+x = Dense(512, activation='relu')(x)
+output = Dense(1, activation='sigmoid')(x)
+
+# Create model
+image_model = Model(inputs=vgg16.input, outputs=output)
+
+# Compile the model
+image_model.compile(optimizer=Adam(learning_rate=0.0001), loss='binary_crossentropy', metrics=['accuracy'])
+
+# Train the model
+image_model.fit(x_train_images, y_train_images, epochs=5, batch_size=32, validation_split=0.2)
+
+# Evaluate image-based model
+image_test_loss, image_test_accuracy = image_model.evaluate(x_test_images, y_test_images)
+print("Image-Based Model Accuracy:", image_test_accuracy)
+
+# --- HYBRID MODEL COMBINATION ---
+# Predict with text-based model
+text_predictions = ensemble_text.predict(xv_test_text)
+
+# Predict with image-based model
+image_predictions = image_model.predict(x_test_images)
+image_predictions = np.round(image_predictions).astype(int).flatten()
+
+# Ensure predictions have the same length
+min_len = min(len(text_predictions), len(image_predictions))
+combined_predictions = (text_predictions[:min_len] + image_predictions[:min_len]) / 2
+
+# Convert to binary predictions (0 or 1)
+hybrid_predictions = np.round(combined_predictions).astype(int)
+
+# Calculate accuracy for hybrid model
+hybrid_accuracy = accuracy_score(y_test_text[:min_len], hybrid_predictions)
+print("Hybrid Model Accuracy:", hybrid_accuracy)
+
+# Generate a classification report for the hybrid model
+print("Hybrid Model Classification Report:")
+print(classification_report(y_test_text[:min_len], hybrid_predictions))
